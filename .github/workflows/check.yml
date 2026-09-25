@@ -1,0 +1,161 @@
+# Reusable workflow: grades SynLearn labs in the CALLER's repository and reports
+# the results to SynLearn, authenticated by a GitHub OIDC token (audience "synlearn").
+# SynLearn trusts the results only because the token's job_workflow_ref claim proves
+# that this file, at an allowed tag/SHA, produced them. See DESIGN.md.
+#
+# Two jobs on purpose:
+#   check  - checks out the learner's repo and runs the checks. No id-token permission,
+#            so nothing a learner commits can mint a SynLearn token.
+#   submit - never checks out learner code. It mints the OIDC token and posts the results.
+name: SynLearn graded checks
+
+on:
+  workflow_call:
+    inputs:
+      labs:
+        description: Lab ids to grade, separated by spaces or commas. Overrides labs-file.
+        type: string
+        required: false
+        default: ""
+      labs-file:
+        description: Repo file listing one lab id per line (# starts a comment).
+        type: string
+        required: false
+        default: .synlearn/graded-labs
+
+permissions: {}
+
+env:
+  # Fixed here, never an input: a learner must not be able to point grading at another server.
+  SYNLEARN_API: https://synlearn-api.synteralabs.co.za
+  MAX_LABS: "50"
+  CHECK_TIMEOUT_SECONDS: "180"
+  MAX_LINES: "200"
+  MAX_MESSAGE_CHARS: "500"
+
+jobs:
+  check:
+    name: Run graded checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      results: ${{ steps.run.outputs.results }}
+      count: ${{ steps.run.outputs.count }}
+    steps:
+      - name: Check out the learner's repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run checks
+        id: run
+        env:
+          LABS_INPUT: ${{ inputs.labs }}
+          LABS_FILE: ${{ inputs.labs-file }}
+        run: |
+          set -euo pipefail
+          lab_id_pattern='^[a-z0-9][a-z0-9-]{0,63}$'
+          work="$(mktemp -d)"
+
+          # 1. Work out which labs to grade.
+          if [ -n "$LABS_INPUT" ]; then
+            printf '%s\n' "$LABS_INPUT" | tr -s ',[:space:]' '\n' > "$work/ids.raw"
+          elif [[ "$LABS_FILE" = /* || "$LABS_FILE" == *..* ]]; then
+            echo "::error::labs-file must be a relative path inside the repository."
+            exit 1
+          elif [ -f "$LABS_FILE" ]; then
+            sed -e 's/#.*//' "$LABS_FILE" | tr -s ',[:space:]' '\n' > "$work/ids.raw"
+          else
+            : > "$work/ids.raw"
+          fi
+          grep -v '^$' "$work/ids.raw" | awk '!seen[$0]++' | head -n "$MAX_LABS" > "$work/ids" || true
+
+          # 2. Fetch and run each lab's graded check from the repo root.
+          echo '[]' > "$work/results.json"
+          while IFS= read -r lab_id; do
+            if ! [[ "$lab_id" =~ $lab_id_pattern ]]; then
+              echo "::warning::Skipping invalid lab id: $lab_id"
+              continue
+            fi
+            if curl -sS --fail --max-time 20 --retry 2 \
+                 "$SYNLEARN_API/api/labs/$lab_id/graded-check" -o "$work/lab.json" \
+               && jq -er '.check | strings' "$work/lab.json" > "$work/check.sh"; then
+              # Clean environment: the check sees no runner tokens or workflow variables.
+              # The runner uses bash -e, so capture a failing exit code instead of aborting.
+              exit_code=0
+              env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 SYNLEARN_REPO_ROOT="$GITHUB_WORKSPACE" \
+                timeout "$CHECK_TIMEOUT_SECONDS" bash "$work/check.sh" < /dev/null > "$work/out.txt" 2>&1 \
+                || exit_code=$?
+              if [ "$exit_code" -eq 124 ]; then
+                echo "FAIL The check took longer than $CHECK_TIMEOUT_SECONDS seconds and was stopped." >> "$work/out.txt"
+              fi
+            else
+              echo "FAIL SynLearn has no graded check for $lab_id (or could not be reached)." > "$work/out.txt"
+              exit_code=1
+            fi
+            # Same contract as the terminal labs: pass only if every line is PASS, there is one, and exit 0.
+            jq -R -s -c --arg lab "$lab_id" --argjson code "$exit_code" \
+               --argjson maxl "$MAX_LINES" --argjson maxc "$MAX_MESSAGE_CHARS" '
+              [ split("\n")[] | sub("^\\s+"; "") | sub("\\s+$"; "")
+                | select(test("^(PASS|FAIL)\\b"))
+                | capture("^(?<status>PASS|FAIL)\\b\\s*(?<message>.*)$")
+                | .message |= .[0:$maxc] ] as $lines
+              | { lab_id: $lab,
+                  passed: (($lines | length) > 0 and ($lines | all(.status == "PASS")) and $code == 0),
+                  exit_code: $code,
+                  lines: $lines[0:$maxl] }' "$work/out.txt" > "$work/one.json"
+            jq -c --slurpfile one "$work/one.json" '. + $one' "$work/results.json" > "$work/next.json"
+            mv "$work/next.json" "$work/results.json"
+          done < "$work/ids"
+
+          # 3. Hand the results to the submit job and show them in the run summary.
+          link_id=""
+          if [ -f .synlearn/link-id ]; then
+            link_id="$(head -c 128 .synlearn/link-id | tr -cd 'A-Za-z0-9_-')"
+          fi
+          payload="$(jq -c --arg link "$link_id" '{results: ., link_id: (if $link == "" then null else $link end)}' "$work/results.json")"
+          count="$(jq 'length' "$work/results.json")"
+          {
+            echo "results=$payload"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## SynLearn graded labs"
+            if [ "$count" -eq 0 ]; then
+              echo "No graded labs listed in \`$LABS_FILE\` yet."
+            fi
+            jq -r '.[] | "### \(.lab_id): \(if .passed then "passed" else "not passed" end)", (.lines[] | "- \(.status) \(.message)")' "$work/results.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  submit:
+    name: Send results to SynLearn
+    needs: check
+    if: needs.check.outputs.count != '' && needs.check.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    steps:
+      - name: Post results with a GitHub OIDC token
+        env:
+          PAYLOAD: ${{ needs.check.outputs.results }}
+        run: |
+          set -euo pipefail
+          oidc_token="$(curl -sS --fail --max-time 20 \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=synlearn" | jq -r '.value')"
+          echo "::add-mask::$oidc_token"
+          printf '%s' "$PAYLOAD" | jq -c '{results: .results, link_id: .link_id}' > body.json
+          curl -sS --fail-with-body --max-time 30 --retry 2 -X POST \
+            -H "Authorization: Bearer $oidc_token" \
+            -H "Content-Type: application/json" \
+            --data @body.json "$SYNLEARN_API/api/labs/graded" > /dev/null
+          echo "Results saved to SynLearn."
+          if jq -e '.results | all(.passed)' body.json > /dev/null; then
+            echo "All graded labs passed."
+          else
+            echo "::error::Some graded labs have not passed yet. Open the run summary to see what to fix."
+            exit 1
+          fi
